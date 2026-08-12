@@ -20,4 +20,17 @@ model User {
   password  String
   name      String?
   createdAt DateTime @default(now())
+  watchlistItems WatchlistItem[]
+}
+
+model WatchlistItem {
+  id         Int      @id @default(autoincrement())
+  userId     Int
+  tmdbId     Int
+  tipo       String
+  estado     String   @default("pendiente")
+  puntuacion Int?
+  nota       String?
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id])
 }

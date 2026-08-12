@@ -75,7 +75,7 @@ app.post('/auth/login', async (req: Request, res: Response) => {
 
 app.post('/watchlist', validarJWT, async (req: RequestConUsuario, res: Response) => {
   try {
-    const { tmdbId, tipo, estado, puntuacion, nota } = req.body;
+    const { tmdbId, tipo, estado } = req.body;
 
     if (!tmdbId || isNaN(Number(tmdbId)) || !tipo) {
       return res.status(400).json({ error: 'tmdbId debe ser un número válido y tipo es obligatorio' });
@@ -93,8 +93,6 @@ app.post('/watchlist', validarJWT, async (req: RequestConUsuario, res: Response)
         tmdbId: Number(tmdbId),
         tipo: tipo,
         estado: estado || 'pendiente',
-        puntuacion: puntuacion ? Number(puntuacion) : null,
-        nota: nota || null,
       },
     });
 
@@ -131,11 +129,16 @@ app.get('/watchlist', validarJWT, async (req: RequestConUsuario, res: Response) 
   }
 });
 
-app.put('/watchlist/:id', validarJWT, async (req: RequestConUsuario, res: Response) => {
+app.patch('/watchlist/:id', validarJWT, async (req: RequestConUsuario, res: Response) => {
   try {
     const { id } = req.params;
     const { estado, puntuacion, nota } = req.body;
     const userIdAutenticado = req.usuario?.id;
+
+    const idNumerico = Number(id);
+    if (isNaN(idNumerico)) {
+      return res.status(400).json({ error: 'El ID debe ser un número válido' });
+    }
 
     if (!userIdAutenticado) {
       return res.status(401).json({ error: 'Usuario no autenticado' });
@@ -146,7 +149,7 @@ app.put('/watchlist/:id', validarJWT, async (req: RequestConUsuario, res: Respon
     }
 
     const itemExistente = await prisma.watchlistItem.findUnique({
-      where: { id: Number(id) }
+      where: { id: idNumerico }
     });
 
     if (!itemExistente) {
@@ -161,7 +164,7 @@ app.put('/watchlist/:id', validarJWT, async (req: RequestConUsuario, res: Respon
       where: { id: Number(id) },
       data: {
         estado: estado !== undefined ? estado : itemExistente.estado,
-        puntuacion: puntuacion !== undefined ? (puntuacion ? Number(puntuacion) : null) : itemExistente.puntuacion,
+        puntuacion: puntuacion !== undefined ? (puntuacion !== null ? Number(puntuacion) : null) : itemExistente.puntuacion,
         nota: nota !== undefined ? nota : itemExistente.nota,
       },
     });
@@ -178,6 +181,11 @@ app.delete('/watchlist/:id', validarJWT, async (req: RequestConUsuario, res: Res
   try {
     const { id } = req.params;
     const userIdAutenticado = req.usuario?.id;
+
+    const idNumerico = Number(id);
+    if (isNaN(idNumerico)) {
+      return res.status(400).json({ error: 'El ID debe ser un número válido' });
+    }
 
     if (!userIdAutenticado) {
       return res.status(401).json({ error: 'Usuario no autenticado' });

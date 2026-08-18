@@ -4,6 +4,7 @@ import { PrismaClient } from './generated/prisma/client';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { validarJWT, RequestConUsuario } from './middleware/auth';
+import { buscarEnTMDb, obtenerDetalleTMDb } from './services/tmdb';
 
 const app = express();
 const PORT = 3000;
@@ -121,7 +122,27 @@ app.get('/watchlist', validarJWT, async (req: RequestConUsuario, res: Response) 
       },
     });
 
-    return res.status(200).json(watchlist);
+    const detallesSettled = await Promise.allSettled(
+      watchlist.map(item => obtenerDetalleTMDb(item.tmdbId, item.tipo))
+    );
+
+    const watchlistEnriquecida = watchlist.map((item, index) => {
+      const resultado = detallesSettled[index];
+
+      if (!resultado) {
+        return { ...item, titulo: null, poster: null };
+      }
+
+      const detalle = resultado.status === 'fulfilled' ? resultado.value : null;
+
+      return {
+        ...item,
+        titulo: detalle?.titulo ?? null,
+        poster: detalle?.poster ?? null,
+      };
+    });
+
+    return res.status(200).json(watchlistEnriquecida);
 
   } catch (error) {
     console.error(error);
@@ -214,6 +235,24 @@ app.delete('/watchlist/:id', validarJWT, async (req: RequestConUsuario, res: Res
     return res.status(500).json({ error: 'Hubo un error al eliminar el ítem' });
   }
 });
+
+app.get('/search', async (req: Request, res: Response) => {
+  try {
+    const { query } = req.query;
+
+    if (!query || typeof query !== 'string') {
+      return res.status(400).json({ error: 'El parámetro "query" es requerido y debe ser un texto' });
+    }
+
+    const resultados = await buscarEnTMDb(query);
+    return res.status(200).json(resultados);
+
+  } catch (error) {
+    console.error('[SEARCH ERROR]', error);
+    return res.status(500).json({ error: 'Hubo un error al realizar la búsqueda en TMDb' });
+  }
+});
+
 
 
 

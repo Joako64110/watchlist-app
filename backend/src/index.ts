@@ -3,236 +3,240 @@ import express, { Request, Response } from 'express';
 import { PrismaClient } from './generated/prisma/client';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import { validarJWT, RequestConUsuario } from './middleware/auth';
-import { buscarEnTMDb, obtenerDetalleTMDb } from './services/tmdb';
+import { authenticateJWT, getJwtSecret, AuthenticatedRequest } from './middleware/auth';
+import { searchTMDb, getTitleDetails } from './services/tmdb';
 
 const app = express();
 const PORT = 3000;
 const prisma = new PrismaClient();
 
+// Allowed values for watchlist item fields. Validating against these lists
+// (instead of trusting any string) keeps the stored data consistent and
+// prevents garbage values from reaching TMDb requests downstream.
+const ALLOWED_TYPES = ['movie', 'tv'] as const;
+const ALLOWED_STATUSES = ['pending', 'watching', 'watched'] as const;
+
 app.use(express.json());
 
-
 app.get('/', (_req: Request, res: Response) => {
-  res.send('hola mundo');
+  res.send('hello world');
 });
 
 app.post('/auth/register', async (req: Request, res: Response) => {
   try {
     const { email, password, name } = req.body;
-    const nuevoUsuario = await prisma.user.create({
+
+    const newUser = await prisma.user.create({
       data: {
-        email: email,
+        email,
         password: await bcrypt.hash(password, 10),
-        name: name,
+        name,
       },
     });
-    
-    res.status(201).json(nuevoUsuario);
+
+    res.status(201).json(newUser);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Hubo un error al crear el usuario' });
+    res.status(500).json({ error: 'An error occurred while creating the user' });
   }
 });
 
 app.post('/auth/login', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
-    const usuario = await prisma.user.findUnique({
-      where: { email: email },
-    });
-    
-    if (!usuario) {
-      console.error(`[LOGIN FALLIDO] Email no encontrado: ${email}`);
-      return res.status(401).json({ error: 'Credenciales inválidas' });
-    }
-    
-    const isMatch = await bcrypt.compare(password, usuario.password);
-    
-    if (!isMatch) {
-      console.error(`[LOGIN FALLIDO] Password incorrecta para: ${email}`);
-      return res.status(401).json({ error: 'Credenciales inválidas' });
-    }
-    
-    const payload = {
-      id: usuario.id,
-      email: usuario.email
-    };
-    const secreto = process.env.JWT_SECRET;
 
-    if (!secreto) {
-      console.error("CRITICAL ERROR: JWT_SECRET no está definido en el archivo .env");
-      return res.status(500).json({ error: "Error interno del servidor" });
+    const user = await prisma.user.findUnique({ where: { email } });
+
+    if (!user) {
+      console.error(`[LOGIN FAILED] Email not found: ${email}`);
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
-    
-    const token = jwt.sign(payload, secreto, { expiresIn: '1h' });
-    
+
+    const isMatch = await bcrypt.compare(password, user.password);
+
+    if (!isMatch) {
+      console.error(`[LOGIN FAILED] Incorrect password for: ${email}`);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    let jwtSecret: string;
+    try {
+      jwtSecret = getJwtSecret();
+    } catch {
+      console.error('CRITICAL ERROR: JWT_SECRET is not defined in .env');
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+
+    const payload = { id: user.id, email: user.email };
+    const token = jwt.sign(payload, jwtSecret, { expiresIn: '1h' });
+
     return res.status(200).json({ token });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Hubo un error al iniciar sesión' });
+    return res.status(500).json({ error: 'An error occurred while logging in' });
   }
 });
 
-app.post('/watchlist', validarJWT, async (req: RequestConUsuario, res: Response) => {
+app.post('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { tmdbId, tipo, estado } = req.body;
+    const { tmdbId, type, status } = req.body;
 
-    if (!tmdbId || isNaN(Number(tmdbId)) || !tipo) {
-      return res.status(400).json({ error: 'tmdbId debe ser un número válido y tipo es obligatorio' });
+    if (!tmdbId || isNaN(Number(tmdbId)) || !ALLOWED_TYPES.includes(type)) {
+      return res.status(400).json({
+        error: `tmdbId must be a valid number and type must be one of: ${ALLOWED_TYPES.join(', ')}`,
+      });
     }
 
-    const userIdAutenticado = req.usuario?.id;
-
-    if (!userIdAutenticado) {
-      return res.status(401).json({ error: 'Usuario no autenticado' });
+    if (status !== undefined && !ALLOWED_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${ALLOWED_STATUSES.join(', ')}` });
     }
 
-    const nuevoItem = await prisma.watchlistItem.create({
+    const authenticatedUserId = req.user?.id;
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    // userId always comes from the verified token, never from the request
+    // body — otherwise a client could create items under someone else's account.
+    const newItem = await prisma.watchlistItem.create({
       data: {
-        userId: userIdAutenticado,
+        userId: authenticatedUserId,
         tmdbId: Number(tmdbId),
-        tipo: tipo,
-        estado: estado || 'pendiente',
+        type,
+        status: status || 'pending',
       },
     });
 
-    return res.status(201).json(nuevoItem);
-
+    return res.status(201).json(newItem);
   } catch (error) {
     console.error(error);
-    return res.status(500).json({ error: 'Hubo un error al agregar el ítem a la lista' });
+    return res.status(500).json({ error: 'An error occurred while adding the item to the list' });
   }
 });
 
-app.get('/watchlist', validarJWT, async (req: RequestConUsuario, res: Response) => {
+app.get('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const userIdAutenticado = req.usuario?.id;
-
-    if (!userIdAutenticado) {
-      return res.status(401).json({ error: 'Usuario no autenticado' });
+    const authenticatedUserId = req.user?.id;
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
     }
 
     const watchlist = await prisma.watchlistItem.findMany({
-      where: {
-        userId: userIdAutenticado,
-      },
-      orderBy: {
-        createdAt: 'desc',
-      },
+      where: { userId: authenticatedUserId },
+      orderBy: { createdAt: 'desc' },
     });
 
-    const detallesSettled = await Promise.allSettled(
-      watchlist.map(item => obtenerDetalleTMDb(item.tmdbId, item.tipo))
+    // Fetch TMDb details for every item in parallel. allSettled (rather than
+    // Promise.all) makes sure one failed lookup doesn't take down the whole
+    // response — that item just comes back with title/poster as null.
+    const settledDetails = await Promise.allSettled(
+      watchlist.map(item => getTitleDetails(item.tmdbId, item.type as 'movie' | 'tv'))
     );
 
-    const watchlistEnriquecida = watchlist.map((item, index) => {
-      const resultado = detallesSettled[index];
+    const enrichedWatchlist = watchlist.map((item, index) => {
+      const result = settledDetails[index];
 
-      if (!resultado) {
-        return { ...item, titulo: null, poster: null };
+      if (!result) {
+        return { ...item, title: null, poster: null };
       }
 
-      const detalle = resultado.status === 'fulfilled' ? resultado.value : null;
+      const details = result.status === 'fulfilled' ? result.value : null;
 
       return {
         ...item,
-        titulo: detalle?.titulo ?? null,
-        poster: detalle?.poster ?? null,
+        title: details?.title ?? null,
+        poster: details?.poster ?? null,
       };
     });
 
-    return res.status(200).json(watchlistEnriquecida);
-
+    return res.status(200).json(enrichedWatchlist);
   } catch (error) {
     console.error(error);
-    return res.status(500).json({ error: 'Hubo un error al obtener la watchlist' });
+    return res.status(500).json({ error: 'An error occurred while fetching the watchlist' });
   }
 });
 
-app.patch('/watchlist/:id', validarJWT, async (req: RequestConUsuario, res: Response) => {
+app.patch('/watchlist/:id', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { estado, puntuacion, nota } = req.body;
-    const userIdAutenticado = req.usuario?.id;
+    const { status, rating, note } = req.body;
+    const authenticatedUserId = req.user?.id;
 
-    const idNumerico = Number(id);
-    if (isNaN(idNumerico)) {
-      return res.status(400).json({ error: 'El ID debe ser un número válido' });
+    const numericId = Number(id);
+    if (isNaN(numericId)) {
+      return res.status(400).json({ error: 'ID must be a valid number' });
     }
 
-    if (!userIdAutenticado) {
-      return res.status(401).json({ error: 'Usuario no autenticado' });
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    if (puntuacion !== undefined && puntuacion !== null && isNaN(Number(puntuacion))) {
-      return res.status(400).json({ error: 'La puntuación debe ser un número válido' });
+    if (status !== undefined && !ALLOWED_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${ALLOWED_STATUSES.join(', ')}` });
     }
 
-    const itemExistente = await prisma.watchlistItem.findUnique({
-      where: { id: idNumerico }
-    });
-
-    if (!itemExistente) {
-      return res.status(404).json({ error: 'El ítem de la watchlist no existe' });
+    if (rating !== undefined && rating !== null && isNaN(Number(rating))) {
+      return res.status(400).json({ error: 'Rating must be a valid number' });
     }
 
-    if (itemExistente.userId !== userIdAutenticado) {
-      return res.status(403).json({ error: 'No tienes permiso para modificar este ítem' });
+    const existingItem = await prisma.watchlistItem.findUnique({ where: { id: numericId } });
+
+    if (!existingItem) {
+      return res.status(404).json({ error: 'Watchlist item not found' });
     }
 
-    const itemActualizado = await prisma.watchlistItem.update({
-      where: { id: Number(id) },
+    // Ownership check: a user can only modify their own items. 403 (not 404)
+    // tells the client the item exists but isn't theirs.
+    if (existingItem.userId !== authenticatedUserId) {
+      return res.status(403).json({ error: 'You do not have permission to modify this item' });
+    }
+
+    const updatedItem = await prisma.watchlistItem.update({
+      where: { id: numericId },
       data: {
-        estado: estado !== undefined ? estado : itemExistente.estado,
-        puntuacion: puntuacion !== undefined ? (puntuacion !== null ? Number(puntuacion) : null) : itemExistente.puntuacion,
-        nota: nota !== undefined ? nota : itemExistente.nota,
+        status: status !== undefined ? status : existingItem.status,
+        rating: rating !== undefined ? (rating !== null ? Number(rating) : null) : existingItem.rating,
+        note: note !== undefined ? note : existingItem.note,
       },
     });
 
-    return res.status(200).json(itemActualizado);
-
+    return res.status(200).json(updatedItem);
   } catch (error) {
     console.error(error);
-    return res.status(500).json({ error: 'Hubo un error al actualizar el ítem' });
+    return res.status(500).json({ error: 'An error occurred while updating the item' });
   }
 });
 
-app.delete('/watchlist/:id', validarJWT, async (req: RequestConUsuario, res: Response) => {
+app.delete('/watchlist/:id', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const userIdAutenticado = req.usuario?.id;
+    const authenticatedUserId = req.user?.id;
 
-    const idNumerico = Number(id);
-    if (isNaN(idNumerico)) {
-      return res.status(400).json({ error: 'El ID debe ser un número válido' });
+    const numericId = Number(id);
+    if (isNaN(numericId)) {
+      return res.status(400).json({ error: 'ID must be a valid number' });
     }
 
-    if (!userIdAutenticado) {
-      return res.status(401).json({ error: 'Usuario no autenticado' });
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    const itemExistente = await prisma.watchlistItem.findUnique({
-      where: { id: Number(id) }
-    });
+    const existingItem = await prisma.watchlistItem.findUnique({ where: { id: numericId } });
 
-    if (!itemExistente) {
-      return res.status(404).json({ error: 'El ítem de la watchlist no existe' });
+    if (!existingItem) {
+      return res.status(404).json({ error: 'Watchlist item not found' });
     }
 
-    if (itemExistente.userId !== userIdAutenticado) {
-      return res.status(403).json({ error: 'No tienes permiso para eliminar este ítem' });
+    if (existingItem.userId !== authenticatedUserId) {
+      return res.status(403).json({ error: 'You do not have permission to delete this item' });
     }
 
-    await prisma.watchlistItem.delete({
-      where: { id: Number(id) }
-    });
+    await prisma.watchlistItem.delete({ where: { id: numericId } });
 
-    return res.status(200).json({ message: 'Ítem eliminado correctamente de tu watchlist' });
-
+    return res.status(200).json({ message: 'Item successfully removed from your watchlist' });
   } catch (error) {
     console.error(error);
-    return res.status(500).json({ error: 'Hubo un error al eliminar el ítem' });
+    return res.status(500).json({ error: 'An error occurred while deleting the item' });
   }
 });
 
@@ -241,25 +245,21 @@ app.get('/search', async (req: Request, res: Response) => {
     const { query } = req.query;
 
     if (!query || typeof query !== 'string') {
-      return res.status(400).json({ error: 'El parámetro "query" es requerido y debe ser un texto' });
+      return res.status(400).json({ error: 'The "query" parameter is required and must be a string' });
     }
 
-    const resultados = await buscarEnTMDb(query);
-    return res.status(200).json(resultados);
-
+    const results = await searchTMDb(query);
+    return res.status(200).json(results);
   } catch (error) {
     console.error('[SEARCH ERROR]', error);
-    return res.status(500).json({ error: 'Hubo un error al realizar la búsqueda en TMDb' });
+    return res.status(500).json({ error: 'An error occurred while searching TMDb' });
   }
 });
 
-
-
-
-app.get('/protegido', validarJWT, (req, res) => {
-  res.json({ message: 'Si ves esto, tu token es válido' });
+app.get('/protected', authenticateJWT, (_req, res) => {
+  res.json({ message: 'If you can see this, your token is valid' });
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor corriendo en http://localhost:${PORT}`);
+  console.log(`Server running at http://localhost:${PORT}`);
 });

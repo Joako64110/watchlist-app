@@ -1,49 +1,63 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 
-export interface RequestConUsuario extends Request {
-  usuario?: {
+export interface AuthenticatedRequest extends Request {
+  user?: {
     id: number;
     email: string;
   };
 }
 
-export const validarJWT = (req: RequestConUsuario, res: Response, next: NextFunction) => {
+// Reads JWT_SECRET in one place, so every route that needs it (this
+// middleware, and the login route that signs new tokens) fails the same
+// way if it's missing, instead of duplicating the same check everywhere.
+export function getJwtSecret(): string {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    throw new Error('JWT_SECRET is not defined in the environment');
+  }
+  return secret;
+}
+
+export const authenticateJWT = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Token no proporcionado' });
+    return res.status(401).json({ error: 'Token not provided' });
   }
 
   const token = authHeader.split(' ')[1];
 
   if (!token) {
-    return res.status(401).json({ error: 'Token no proporcionado' });
-}
+    return res.status(401).json({ error: 'Token not provided' });
+  }
+
+  let jwtSecret: string;
+  try {
+    jwtSecret = getJwtSecret();
+  } catch {
+    console.error('CRITICAL ERROR: JWT_SECRET is not defined in .env');
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 
   try {
-    const secreto = process.env.JWT_SECRET;
+    // Explicitly whitelisting the algorithm is a defensive habit: it stops
+    // a token from being accepted if it was signed with an algorithm other
+    // than the one this server actually uses.
+    const decodedPayload = jwt.verify(token, jwtSecret, { algorithms: ['HS256'] });
 
-    if (!secreto) {
-      console.error("CRITICAL ERROR: JWT_SECRET no definido en el .env");
-      return res.status(500).json({ error: 'Error interno del servidor' });
+    if (typeof decodedPayload === 'string') {
+      return res.status(401).json({ error: 'Invalid or expired token' });
     }
 
-    const payloadDecodificado = jwt.verify(token, secreto, {});
-
-    if (typeof payloadDecodificado === 'string') {
-        return res.status(401).json({ error: 'Token inválido o expirado' });
-    }
-
-    req.usuario = {
-      id: payloadDecodificado.id,
-      email: payloadDecodificado.email,
+    req.user = {
+      id: decodedPayload.id,
+      email: decodedPayload.email,
     };
 
     next();
-
   } catch (error) {
-    console.error('[MIDDLEWARE AUTH ERROR]', error);
-    return res.status(401).json({ error: 'Token inválido o expirado' });
+    console.error('[AUTH MIDDLEWARE ERROR]', error);
+    return res.status(401).json({ error: 'Invalid or expired token' });
   }
 };

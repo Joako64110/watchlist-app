@@ -1,10 +1,18 @@
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
-import { PrismaClient } from './generated/prisma/client';
+import { PrismaClient, Prisma } from './generated/prisma/client';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { authenticateJWT, getJwtSecret, AuthenticatedRequest } from './middleware/auth';
-import { searchTMDb, getTitleDetails } from './services/tmdb';
+import {
+  searchTMDb,
+  getTitleDetails,
+  ALLOWED_LANGUAGES,
+  TmdbLanguage,
+  isTmdbLanguage,
+  dbLanguageToTmdb,
+  tmdbLanguageToDb,
+} from './services/tmdb';
 
 const app = express();
 const PORT = 3000;
@@ -16,6 +24,31 @@ const prisma = new PrismaClient();
 const ALLOWED_TYPES = ['movie', 'tv'] as const;
 const ALLOWED_STATUSES = ['pending', 'watching', 'watched'] as const;
 
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
+function isValidEmail(value: unknown): value is string {
+  return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+}
+
+async function getUserLanguage(userId: number): Promise<TmdbLanguage | null> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { language: true },
+  });
+
+  if (!user) {
+    return null;
+  }
+
+  return dbLanguageToTmdb(user.language) ?? null;
+}
+
 app.use(express.json());
 
 app.get('/', (_req: Request, res: Response) => {
@@ -26,16 +59,37 @@ app.post('/auth/register', async (req: Request, res: Response) => {
   try {
     const { email, password, name } = req.body;
 
+    if (!isValidEmail(email) || typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ error: 'A valid email and a password of at least 8 characters are required' });
+    }
+
+    if (name !== undefined && (typeof name !== 'string' || name.length > 100)) {
+      return res.status(400).json({ error: 'name must be a string of at most 100 characters' });
+    }
+
     const newUser = await prisma.user.create({
       data: {
         email,
         password: await bcrypt.hash(password, 10),
-        name,
+        name
+      },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        language: true,
+        createdAt: true,
       },
     });
 
-    res.status(201).json(newUser);
+    const responseLanguage = dbLanguageToTmdb(newUser.language);
+
+    res.status(201).json({ ...newUser, language: responseLanguage });
   } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      return res.status(409).json({ error: 'An account with that email already exists' });
+    }
+
     console.error(error);
     res.status(500).json({ error: 'An error occurred while creating the user' });
   }
@@ -77,13 +131,48 @@ app.post('/auth/login', async (req: Request, res: Response) => {
   }
 });
 
+app.patch('/users/me', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const authenticatedUserId = req.user?.id;
+    const { language } = req.body;
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (typeof language !== 'string' || !isTmdbLanguage(language)) {
+      return res.status(400).json({ error: `language must be one of: ${ALLOWED_LANGUAGES.join(', ')}` });
+    }
+
+    const updatedUser = await prisma.user.update({
+      where: { id: authenticatedUserId },
+      data: { language: tmdbLanguageToDb(language) },
+      select: { id: true, email: true, name: true, language: true },
+    });
+
+    const responseLanguage = dbLanguageToTmdb(updatedUser.language);
+
+    if (!responseLanguage) {
+      return res.status(500).json({ error: 'Stored user language is invalid' });
+    }
+
+    return res.status(200).json({
+      ...updatedUser,
+      language: responseLanguage,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'An error occurred while updating your preferences' });
+  }
+});
+
 app.post('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { tmdbId, type, status } = req.body;
 
-    if (!tmdbId || isNaN(Number(tmdbId)) || !ALLOWED_TYPES.includes(type)) {
+    if (!isPositiveInteger(tmdbId) || !ALLOWED_TYPES.includes(type)) {
       return res.status(400).json({
-        error: `tmdbId must be a valid number and type must be one of: ${ALLOWED_TYPES.join(', ')}`,
+        error: `tmdbId must be a positive integer and type must be one of: ${ALLOWED_TYPES.join(', ')}`,
       });
     }
 
@@ -101,7 +190,7 @@ app.post('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: R
     const newItem = await prisma.watchlistItem.create({
       data: {
         userId: authenticatedUserId,
-        tmdbId: Number(tmdbId),
+        tmdbId,
         type,
         status: status || 'pending',
       },
@@ -109,6 +198,10 @@ app.post('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: R
 
     return res.status(201).json(newItem);
   } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      return res.status(409).json({ error: 'This title is already in your watchlist' });
+    }
+
     console.error(error);
     return res.status(500).json({ error: 'An error occurred while adding the item to the list' });
   }
@@ -121,6 +214,12 @@ app.get('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: Re
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
+    const language = await getUserLanguage(authenticatedUserId);
+
+    if (!language) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
     const watchlist = await prisma.watchlistItem.findMany({
       where: { userId: authenticatedUserId },
       orderBy: { createdAt: 'desc' },
@@ -130,7 +229,7 @@ app.get('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: Re
     // Promise.all) makes sure one failed lookup doesn't take down the whole
     // response — that item just comes back with title/poster as null.
     const settledDetails = await Promise.allSettled(
-      watchlist.map(item => getTitleDetails(item.tmdbId, item.type as 'movie' | 'tv'))
+      watchlist.map(item => getTitleDetails(item.tmdbId, item.type as 'movie' | 'tv', language))
     );
 
     const enrichedWatchlist = watchlist.map((item, index) => {
@@ -163,7 +262,7 @@ app.patch('/watchlist/:id', authenticateJWT, async (req: AuthenticatedRequest, r
     const authenticatedUserId = req.user?.id;
 
     const numericId = Number(id);
-    if (isNaN(numericId)) {
+    if (!isPositiveInteger(numericId)) {
       return res.status(400).json({ error: 'ID must be a valid number' });
     }
 
@@ -175,8 +274,8 @@ app.patch('/watchlist/:id', authenticateJWT, async (req: AuthenticatedRequest, r
       return res.status(400).json({ error: `status must be one of: ${ALLOWED_STATUSES.join(', ')}` });
     }
 
-    if (rating !== undefined && rating !== null && isNaN(Number(rating))) {
-      return res.status(400).json({ error: 'Rating must be a valid number' });
+    if (rating !== undefined && rating !== null && (!isPositiveInteger(rating) && rating !== 0 || rating > 10)) {
+      return res.status(400).json({ error: 'Rating must be an integer between 0 and 10' });
     }
 
     const existingItem = await prisma.watchlistItem.findUnique({ where: { id: numericId } });
@@ -195,7 +294,7 @@ app.patch('/watchlist/:id', authenticateJWT, async (req: AuthenticatedRequest, r
       where: { id: numericId },
       data: {
         status: status !== undefined ? status : existingItem.status,
-        rating: rating !== undefined ? (rating !== null ? Number(rating) : null) : existingItem.rating,
+        rating: rating !== undefined ? rating : existingItem.rating,
         note: note !== undefined ? note : existingItem.note,
       },
     });
@@ -213,7 +312,7 @@ app.delete('/watchlist/:id', authenticateJWT, async (req: AuthenticatedRequest, 
     const authenticatedUserId = req.user?.id;
 
     const numericId = Number(id);
-    if (isNaN(numericId)) {
+    if (!isPositiveInteger(numericId)) {
       return res.status(400).json({ error: 'ID must be a valid number' });
     }
 
@@ -240,15 +339,31 @@ app.delete('/watchlist/:id', authenticateJWT, async (req: AuthenticatedRequest, 
   }
 });
 
-app.get('/search', async (req: Request, res: Response) => {
+app.get('/search', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { query } = req.query;
+    const { query, lang } = req.query;
+    const authenticatedUserId = req.user?.id;
 
     if (!query || typeof query !== 'string') {
       return res.status(400).json({ error: 'The "query" parameter is required and must be a string' });
     }
 
-    const results = await searchTMDb(query);
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (lang !== undefined && (typeof lang !== 'string' || !isTmdbLanguage(lang))) {
+      return res.status(400).json({ error: `lang must be one of: ${ALLOWED_LANGUAGES.join(', ')}` });
+    }
+
+    const userLanguage = await getUserLanguage(authenticatedUserId);
+
+    if (!userLanguage) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const language = (lang && isTmdbLanguage(lang) ? lang : userLanguage);
+    const results = await searchTMDb(query, language);
     return res.status(200).json(results);
   } catch (error) {
     console.error('[SEARCH ERROR]', error);

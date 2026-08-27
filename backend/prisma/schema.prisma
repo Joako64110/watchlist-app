@@ -14,11 +14,20 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum Language {
+  es_ES
+  en_US
+  pt_BR
+  fr_FR
+  de_DE
+}
+
 model User {
   id             Int             @id @default(autoincrement())
   email          String          @unique
   password       String
   name           String?
+  language       Language        @default(es_ES)
   createdAt      DateTime        @default(now())
   watchlistItems WatchlistItem[]
 }
@@ -40,4 +49,5 @@ model WatchlistItem {
   // Every query on this table filters by userId — this index keeps those
   // lookups fast as the table grows.
   @@index([userId])
+  @@unique([userId, tmdbId, type])
 }

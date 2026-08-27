@@ -44,7 +44,7 @@ model WatchlistItem {
   rating    Int?
   note      String?
   createdAt DateTime @default(now())
-  user      User     @relation(fields: [userId], references: [id])
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Every query on this table filters by userId — this index keeps those
   // lookups fast as the table grows.

@@ -1,6 +1,7 @@
 import axios from 'axios';
 
 const TMDB_BASE_URL = 'https://api.themoviedb.org/3';
+const TMDB_REQUEST_TIMEOUT_MS = 5000;
 
 // Minimal shape of what TMDb's /search/multi returns — just the fields we
 // actually read. Avoids `any` and catches typos in field names at compile time.
@@ -73,7 +74,10 @@ function buildAuthHeaders() {
 
 export async function searchTMDb(query: string, language: TmdbLanguage = 'es-ES'): Promise<SearchResult[]> {
   const url = `${TMDB_BASE_URL}/search/multi?language=${encodeURIComponent(language)}&query=${encodeURIComponent(query)}`;
-  const response = await axios.get(url, { headers: buildAuthHeaders() });
+  const response = await axios.get(url, {
+    headers: buildAuthHeaders(),
+    timeout: TMDB_REQUEST_TIMEOUT_MS,
+  });
   const rawResults: TmdbSearchItem[] = response.data.results || [];
 
   return rawResults
@@ -100,7 +104,10 @@ export async function getTitleDetails(
   language: TmdbLanguage = 'es-ES'
 ): Promise<TitleDetails> {
   const url = `${TMDB_BASE_URL}/${type}/${tmdbId}?language=${encodeURIComponent(language)}`;
-  const response = await axios.get(url, { headers: buildAuthHeaders() });
+  const response = await axios.get(url, {
+    headers: buildAuthHeaders(),
+    timeout: TMDB_REQUEST_TIMEOUT_MS,
+  });
   const data = response.data;
 
   return {

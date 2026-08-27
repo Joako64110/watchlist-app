@@ -3,6 +3,7 @@ import express, { Request, Response } from 'express';
 import { PrismaClient, Prisma } from './generated/prisma/client';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import rateLimit from 'express-rate-limit';
 import { authenticateJWT, getJwtSecret, AuthenticatedRequest } from './middleware/auth';
 import {
   searchTMDb,
@@ -23,6 +24,14 @@ const prisma = new PrismaClient();
 // prevents garbage values from reaching TMDb requests downstream.
 const ALLOWED_TYPES = ['movie', 'tv'] as const;
 const ALLOWED_STATUSES = ['pending', 'watching', 'watched'] as const;
+
+const authRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Please try again later.' },
+});
 
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value > 0;
@@ -55,7 +64,7 @@ app.get('/', (_req: Request, res: Response) => {
   res.send('hello world');
 });
 
-app.post('/auth/register', async (req: Request, res: Response) => {
+app.post('/auth/register', authRateLimit, async (req: Request, res: Response) => {
   try {
     const { email, password, name } = req.body;
 
@@ -95,7 +104,7 @@ app.post('/auth/register', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/auth/login', async (req: Request, res: Response) => {
+app.post('/auth/login', authRateLimit, async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
 
@@ -163,6 +172,43 @@ app.patch('/users/me', authenticateJWT, async (req: AuthenticatedRequest, res: R
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: 'An error occurred while updating your preferences' });
+  }
+});
+
+app.delete('/users/me', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const authenticatedUserId = req.user?.id;
+    const { password } = req.body;
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (typeof password !== 'string' || password.length === 0) {
+      return res.status(400).json({ error: 'Password is required' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: authenticatedUserId },
+      select: { password: true },
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid password' });
+    }
+
+    await prisma.user.delete({ where: { id: authenticatedUserId } });
+
+    return res.status(204).send();
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'An error occurred while deleting your account' });
   }
 });
 

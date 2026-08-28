@@ -28,7 +28,9 @@ interface TitleDetails {
   poster: string | null;
 }
 
-// Keep in sync with the Language enum in schema.prisma
+// Prisma enum members can't contain hyphens, so the language is stored with
+// underscores (es_ES) and converted to TMDb's hyphenated format (es-ES) at
+// the API boundary. Keep this list in sync with the Language enum in schema.prisma.
 const DB_LANGUAGE_TO_TMDB = {
   es_ES: 'es-ES',
   en_US: 'en-US',
@@ -41,6 +43,7 @@ type DbLanguage = keyof typeof DB_LANGUAGE_TO_TMDB;
 export type TmdbLanguage = (typeof DB_LANGUAGE_TO_TMDB)[DbLanguage];
 export const ALLOWED_LANGUAGES = Object.values(DB_LANGUAGE_TO_TMDB) as TmdbLanguage[];
 
+// Reverse lookup, generated once from the map above instead of duplicated by hand.
 const TMDB_LANGUAGE_TO_DB: Record<TmdbLanguage, DbLanguage> = Object.fromEntries(
   Object.entries(DB_LANGUAGE_TO_TMDB).map(([dbLanguage, tmdbLanguage]) => [tmdbLanguage, dbLanguage])
 ) as Record<TmdbLanguage, DbLanguage>;

@@ -8,6 +8,9 @@ export interface AuthenticatedRequest extends Request {
   };
 }
 
+// Defensive check: even a token with a valid signature could carry a
+// differently-shaped payload (e.g. if what we sign ever changes) — this
+// catches that instead of trusting the decoded object blindly.
 function isValidJwtPayload(payload: object): payload is { id: number; email: string } {
   const candidate = payload as { id?: unknown; email?: unknown };
   return (

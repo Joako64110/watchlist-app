@@ -55,10 +55,12 @@ model WatchlistItem {
   rating    Int?
   note      String?
   createdAt DateTime @default(now())
+  // Cascade: deleting a user removes their watchlist items too.
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Every query on this table filters by userId — this index keeps those
   // lookups fast as the table grows.
   @@index([userId])
+  // Prevents adding the same title (movie or tv) twice for the same user.
   @@unique([userId, tmdbId, type])
 }

@@ -27,6 +27,9 @@ const prisma = new PrismaClient();
 const ALLOWED_TYPES = ['movie', 'tv'] as const;
 const ALLOWED_STATUSES = ['pending', 'watching', 'watched'] as const;
 
+// Shared across register and login, and keyed by IP (express-rate-limit's
+// default) rather than by email — limiting per email would let an attacker
+// try unlimited passwords by rotating through different email addresses.
 const authRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 5,
@@ -39,10 +42,14 @@ function isPositiveInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value > 0;
 }
 
+// Intentionally simple: filters out obvious garbage, not a full RFC 5322
+// validator. Real verification of an email happens by confirming it works
+// (e.g. a verification link), not by regex.
 function isValidEmail(value: unknown): value is string {
   return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
+// P2002 is Prisma's error code for a unique constraint violation.
 function isUniqueConstraintError(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 }
@@ -51,6 +58,8 @@ function isValidRating(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 10;
 }
 
+// Shared by /watchlist and /search: looks up the user's stored language
+// preference and converts it from the DB's underscore format to TMDb's.
 async function getUserLanguage(userId: number): Promise<TmdbLanguage | null> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -64,6 +73,9 @@ async function getUserLanguage(userId: number): Promise<TmdbLanguage | null> {
   return dbLanguageToTmdb(user.language) ?? null;
 }
 
+// Security middleware: safe HTTP headers (helmet), cross-origin requests
+// restricted to the configured frontend (cors), and a cap on request body
+// size to limit the impact of oversized payloads (express.json limit).
 app.use(helmet());
 app.use(cors({ origin: process.env.FRONTEND_URL ?? 'http://localhost:5173' }));
 app.use(express.json({ limit: '10kb' }));
@@ -205,12 +217,16 @@ app.delete('/users/me', authenticateJWT, async (req: AuthenticatedRequest, res: 
       return res.status(404).json({ error: 'User not found' });
     }
 
+    // Re-checking the password (not just a valid session token) protects
+    // against a stolen or leaked token being used to delete the account.
     const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
       return res.status(401).json({ error: 'Invalid password' });
     }
 
+    // Cascades to the user's watchlist items via the onDelete: Cascade
+    // relation in schema.prisma — no manual cleanup needed here.
     await prisma.user.delete({ where: { id: authenticatedUserId } });
 
     return res.status(204).send();
@@ -252,6 +268,7 @@ app.post('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: R
 
     return res.status(201).json(newItem);
   } catch (error) {
+    // Triggered by the @@unique([userId, tmdbId, type]) constraint in schema.prisma.
     if (isUniqueConstraintError(error)) {
       return res.status(409).json({ error: 'This title is already in your watchlist' });
     }
@@ -393,6 +410,9 @@ app.delete('/watchlist/:id', authenticateJWT, async (req: AuthenticatedRequest, 
   }
 });
 
+// Requires auth (unlike a typical public search) so the response can use
+// the requester's language preference, and so TMDb usage stays tied to
+// registered users rather than being open to anonymous traffic.
 app.get('/search', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { query, lang } = req.query;
@@ -416,6 +436,7 @@ app.get('/search', authenticateJWT, async (req: AuthenticatedRequest, res: Respo
       return res.status(404).json({ error: 'User not found' });
     }
 
+    // An explicit ?lang= overrides the user's stored preference for this request only.
     const language = (lang && isTmdbLanguage(lang) ? lang : userLanguage);
     const results = await searchTMDb(query, language);
     return res.status(200).json(results);

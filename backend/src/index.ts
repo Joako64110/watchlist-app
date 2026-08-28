@@ -47,6 +47,10 @@ function isUniqueConstraintError(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 }
 
+function isValidRating(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 10;
+}
+
 async function getUserLanguage(userId: number): Promise<TmdbLanguage | null> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -279,7 +283,7 @@ app.get('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: Re
     // Promise.all) makes sure one failed lookup doesn't take down the whole
     // response — that item just comes back with title/poster as null.
     const settledDetails = await Promise.allSettled(
-      watchlist.map(item => getTitleDetails(item.tmdbId, item.type as 'movie' | 'tv', language))
+      watchlist.map(item => getTitleDetails(item.tmdbId, item.type, language))
     );
 
     const enrichedWatchlist = watchlist.map((item, index) => {
@@ -324,7 +328,7 @@ app.patch('/watchlist/:id', authenticateJWT, async (req: AuthenticatedRequest, r
       return res.status(400).json({ error: `status must be one of: ${ALLOWED_STATUSES.join(', ')}` });
     }
 
-    if (rating !== undefined && rating !== null && (!isPositiveInteger(rating) && rating !== 0 || rating > 10)) {
+    if (rating !== undefined && rating !== null && !isValidRating(rating)) {
       return res.status(400).json({ error: 'Rating must be an integer between 0 and 10' });
     }
 

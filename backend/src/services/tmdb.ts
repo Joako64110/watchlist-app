@@ -28,6 +28,7 @@ interface TitleDetails {
   poster: string | null;
 }
 
+// Keep in sync with the Language enum in schema.prisma
 const DB_LANGUAGE_TO_TMDB = {
   es_ES: 'es-ES',
   en_US: 'en-US',

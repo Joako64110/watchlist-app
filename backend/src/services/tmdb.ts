@@ -1,6 +1,7 @@
 import axios from 'axios';
 
 const TMDB_BASE_URL = 'https://api.themoviedb.org/3';
+const TMDB_REQUEST_TIMEOUT_MS = 5000;
 
 // Minimal shape of what TMDb's /search/multi returns — just the fields we
 // actually read. Avoids `any` and catches typos in field names at compile time.
@@ -27,6 +28,42 @@ interface TitleDetails {
   poster: string | null;
 }
 
+// Prisma enum members can't contain hyphens, so the language is stored with
+// underscores (es_ES) and converted to TMDb's hyphenated format (es-ES) at
+// the API boundary. Keep this list in sync with the Language enum in schema.prisma.
+const DB_LANGUAGE_TO_TMDB = {
+  es_ES: 'es-ES',
+  en_US: 'en-US',
+  pt_BR: 'pt-BR',
+  fr_FR: 'fr-FR',
+  de_DE: 'de-DE',
+} as const;
+
+type DbLanguage = keyof typeof DB_LANGUAGE_TO_TMDB;
+export type TmdbLanguage = (typeof DB_LANGUAGE_TO_TMDB)[DbLanguage];
+export const ALLOWED_LANGUAGES = Object.values(DB_LANGUAGE_TO_TMDB) as TmdbLanguage[];
+
+// Reverse lookup, generated once from the map above instead of duplicated by hand.
+const TMDB_LANGUAGE_TO_DB: Record<TmdbLanguage, DbLanguage> = Object.fromEntries(
+  Object.entries(DB_LANGUAGE_TO_TMDB).map(([dbLanguage, tmdbLanguage]) => [tmdbLanguage, dbLanguage])
+) as Record<TmdbLanguage, DbLanguage>;
+
+export function isTmdbLanguage(value: unknown): value is TmdbLanguage {
+  return typeof value === 'string' && ALLOWED_LANGUAGES.includes(value as TmdbLanguage);
+}
+
+export function tmdbLanguageToDb(value: TmdbLanguage): DbLanguage {
+  return TMDB_LANGUAGE_TO_DB[value];
+}
+
+export function dbLanguageToTmdb(value: unknown): TmdbLanguage | null {
+  if (typeof value !== 'string' || !(value in DB_LANGUAGE_TO_TMDB)) {
+    return null;
+  }
+
+  return DB_LANGUAGE_TO_TMDB[value as DbLanguage];
+}
+
 function buildPosterUrl(posterPath: string | null): string | null {
   return posterPath ? `https://image.tmdb.org/t/p/w500${posterPath}` : null;
 }
@@ -39,9 +76,12 @@ function buildAuthHeaders() {
   return { Authorization: `Bearer ${token}` };
 }
 
-export async function searchTMDb(query: string): Promise<SearchResult[]> {
-  const url = `${TMDB_BASE_URL}/search/multi?language=es-ES&query=${encodeURIComponent(query)}`;
-  const response = await axios.get(url, { headers: buildAuthHeaders() });
+export async function searchTMDb(query: string, language: TmdbLanguage = 'es-ES'): Promise<SearchResult[]> {
+  const url = `${TMDB_BASE_URL}/search/multi?language=${encodeURIComponent(language)}&query=${encodeURIComponent(query)}`;
+  const response = await axios.get(url, {
+    headers: buildAuthHeaders(),
+    timeout: TMDB_REQUEST_TIMEOUT_MS,
+  });
   const rawResults: TmdbSearchItem[] = response.data.results || [];
 
   return rawResults
@@ -62,13 +102,20 @@ export async function searchTMDb(query: string): Promise<SearchResult[]> {
     });
 }
 
-export async function getTitleDetails(tmdbId: number, type: 'movie' | 'tv'): Promise<TitleDetails> {
-  const url = `${TMDB_BASE_URL}/${type}/${tmdbId}?language=es-ES`;
-  const response = await axios.get(url, { headers: buildAuthHeaders() });
+export async function getTitleDetails(
+  tmdbId: number,
+  type: 'movie' | 'tv',
+  language: TmdbLanguage = 'es-ES'
+): Promise<TitleDetails> {
+  const url = `${TMDB_BASE_URL}/${type}/${tmdbId}?language=${encodeURIComponent(language)}`;
+  const response = await axios.get(url, {
+    headers: buildAuthHeaders(),
+    timeout: TMDB_REQUEST_TIMEOUT_MS,
+  });
   const data = response.data;
 
   return {
     title: type === 'movie' ? data.title : data.name,
     poster: buildPosterUrl(data.poster_path),
   };
-}
+} 

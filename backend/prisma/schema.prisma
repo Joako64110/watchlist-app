@@ -14,11 +14,31 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum Language {
+  es_ES
+  en_US
+  pt_BR
+  fr_FR
+  de_DE
+}
+
+enum WatchlistType {
+  movie
+  tv
+}
+
+enum WatchlistStatus {
+  pending
+  watching
+  watched
+}
+
 model User {
   id             Int             @id @default(autoincrement())
   email          String          @unique
   password       String
   name           String?
+  language       Language        @default(es_ES)
   createdAt      DateTime        @default(now())
   watchlistItems WatchlistItem[]
 }
@@ -30,14 +50,17 @@ model WatchlistItem {
   id        Int      @id @default(autoincrement())
   userId    Int
   tmdbId    Int
-  type      String
-  status    String   @default("pending")
+  type      WatchlistType
+  status    WatchlistStatus @default(pending)
   rating    Int?
   note      String?
   createdAt DateTime @default(now())
-  user      User     @relation(fields: [userId], references: [id])
+  // Cascade: deleting a user removes their watchlist items too.
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Every query on this table filters by userId — this index keeps those
   // lookups fast as the table grows.
   @@index([userId])
+  // Prevents adding the same title (movie or tv) twice for the same user.
+  @@unique([userId, tmdbId, type])
 }

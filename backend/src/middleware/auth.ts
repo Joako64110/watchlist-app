@@ -8,6 +8,19 @@ export interface AuthenticatedRequest extends Request {
   };
 }
 
+// Defensive check: even a token with a valid signature could carry a
+// differently-shaped payload (e.g. if what we sign ever changes) — this
+// catches that instead of trusting the decoded object blindly.
+function isValidJwtPayload(payload: object): payload is { id: number; email: string } {
+  const candidate = payload as { id?: unknown; email?: unknown };
+  return (
+    typeof candidate.id === 'number' &&
+    Number.isInteger(candidate.id) &&
+    candidate.id > 0 &&
+    typeof candidate.email === 'string'
+  );
+}
+
 // Reads JWT_SECRET in one place, so every route that needs it (this
 // middleware, and the login route that signs new tokens) fails the same
 // way if it's missing, instead of duplicating the same check everywhere.
@@ -48,6 +61,10 @@ export const authenticateJWT = (req: AuthenticatedRequest, res: Response, next: 
 
     if (typeof decodedPayload === 'string') {
       return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    if (!isValidJwtPayload(decodedPayload)) {
+      return res.status(401).json({ error: 'Invalid token payload' });
     }
 
     req.user = {

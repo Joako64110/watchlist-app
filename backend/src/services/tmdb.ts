@@ -84,7 +84,7 @@ const TMDB_LANGUAGE_TO_DB: Record<TmdbLanguage, DbLanguage> = Object.fromEntries
 ) as Record<TmdbLanguage, DbLanguage>;
 
 const RECENT_POSTERS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const RECENT_POSTERS_LIMIT = 40;
+const RECENT_POSTERS_CACHE_SIZE = 60;
 const recentPostersCache = new Map<TmdbLanguage, { posters: string[]; fetchedAt: number }>();
 
 export function isTmdbLanguage(value: unknown): value is TmdbLanguage {
@@ -256,32 +256,34 @@ export async function discoverTitles(
 
 // Cached per language so the landing page's poster wall doesn't hit TMDb
 // on every visit — it refreshes at most once per RECENT_POSTERS_CACHE_TTL_MS.
-export async function getRecentPosters(language: TmdbLanguage = 'es-ES'): Promise<string[]> {
+export async function getRecentPosters(language: TmdbLanguage = 'es-ES', limit = 40): Promise<string[]> {
   const cached = recentPostersCache.get(language);
+
   if (cached && Date.now() - cached.fetchedAt < RECENT_POSTERS_CACHE_TTL_MS) {
-    return cached.posters;
+    return cached.posters.slice(0, Math.min(limit, cached.posters.length));
   }
 
   const headers = buildAuthHeaders();
-  const [moviesResponse, tvResponse] = await Promise.all([
-    axios.get(`${TMDB_BASE_URL}/discover/movie?language=${encodeURIComponent(language)}&sort_by=primary_release_date.desc&primary_release_date.lte=${new Date().toISOString().slice(0, 10)}`, {
-      headers,
-      timeout: TMDB_REQUEST_TIMEOUT_MS,
-    }),
-    axios.get(`${TMDB_BASE_URL}/discover/tv?language=${encodeURIComponent(language)}&sort_by=first_air_date.desc&first_air_date.lte=${new Date().toISOString().slice(0, 10)}`, {
-      headers,
-      timeout: TMDB_REQUEST_TIMEOUT_MS,
-    }),
+  const today = new Date().toISOString().slice(0, 10);
+
+  // A single TMDb page only returns 20 results. Fetching two pages per type
+  // (40 movies + 40 TV, before filtering) gives enough raw candidates for
+  // the pool to actually reach RECENT_POSTERS_CACHE_SIZE.
+  const [moviesPage1, moviesPage2, tvPage1, tvPage2] = await Promise.all([
+    axios.get(`${TMDB_BASE_URL}/discover/movie?language=${encodeURIComponent(language)}&sort_by=primary_release_date.desc&primary_release_date.lte=${today}&page=1`, { headers, timeout: TMDB_REQUEST_TIMEOUT_MS }),
+    axios.get(`${TMDB_BASE_URL}/discover/movie?language=${encodeURIComponent(language)}&sort_by=primary_release_date.desc&primary_release_date.lte=${today}&page=2`, { headers, timeout: TMDB_REQUEST_TIMEOUT_MS }),
+    axios.get(`${TMDB_BASE_URL}/discover/tv?language=${encodeURIComponent(language)}&sort_by=first_air_date.desc&first_air_date.lte=${today}&page=1`, { headers, timeout: TMDB_REQUEST_TIMEOUT_MS }),
+    axios.get(`${TMDB_BASE_URL}/discover/tv?language=${encodeURIComponent(language)}&sort_by=first_air_date.desc&first_air_date.lte=${today}&page=2`, { headers, timeout: TMDB_REQUEST_TIMEOUT_MS }),
   ]);
 
   // TMDb has no single endpoint that mixes movies and TV sorted by date, so
   // we fetch each type's most recent releases separately and merge+re-sort here.
   const datedItems = [
-    ...(moviesResponse.data.results as TmdbDiscoverItem[]).map(item => ({
+    ...[...moviesPage1.data.results, ...moviesPage2.data.results].map((item: TmdbDiscoverItem) => ({
       poster: buildPosterUrl(item.poster_path),
       date: item.release_date,
     })),
-    ...(tvResponse.data.results as TmdbDiscoverItem[]).map(item => ({
+    ...[...tvPage1.data.results, ...tvPage2.data.results].map((item: TmdbDiscoverItem) => ({
       poster: buildPosterUrl(item.poster_path),
       date: item.first_air_date,
     })),
@@ -290,9 +292,9 @@ export async function getRecentPosters(language: TmdbLanguage = 'es-ES'): Promis
   const posters = datedItems
     .filter((item): item is { poster: string; date: string } => Boolean(item.poster && item.date))
     .sort((a, b) => b.date.localeCompare(a.date))
-    .slice(0, RECENT_POSTERS_LIMIT)
+    .slice(0, RECENT_POSTERS_CACHE_SIZE)
     .map(item => item.poster);
 
   recentPostersCache.set(language, { posters, fetchedAt: Date.now() });
-  return posters;
+  return posters.slice(0, Math.min(limit, posters.length));
 }

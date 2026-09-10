@@ -137,13 +137,22 @@ app.get('/', (_req: Request, res: Response) => {
 
 app.get('/trending', trendingRateLimit, async (req: Request, res: Response) => {
   try {
-    const { lang } = req.query;
+    const { lang, limit } = req.query;
 
     if (lang !== undefined && (typeof lang !== 'string' || !isTmdbLanguage(lang))) {
       return res.status(400).json({ error: `lang must be one of: ${ALLOWED_LANGUAGES.join(', ')}` });
     }
 
-    const posters = await getRecentPosters(lang && isTmdbLanguage(lang) ? lang : 'es-ES');
+    let requestedLimit = 40;
+    if (limit !== undefined) {
+      const parsed = parseOptionalPositiveInteger(limit);
+      if (parsed === null || parsed === undefined || parsed > 60) {
+        return res.status(400).json({ error: 'limit must be a positive integer up to 60' });
+      }
+      requestedLimit = parsed;
+    }
+
+    const posters = await getRecentPosters(lang && isTmdbLanguage(lang) ? lang : 'es-ES', requestedLimit);
     return res.status(200).json(posters);
   } catch (error) {
     console.error('[TRENDING ERROR]', error);

@@ -10,8 +10,13 @@ import { authenticateJWT, getJwtSecret, AuthenticatedRequest } from './middlewar
 import {
   searchTMDb,
   getTitleDetails,
+  getTitleFullDetails,
+  getRecentPosters,
+  getGenres,
+  discoverTitles,
   ALLOWED_LANGUAGES,
   TmdbLanguage,
+  TmdbTitleType,
   isTmdbLanguage,
   dbLanguageToTmdb,
   tmdbLanguageToDb,
@@ -38,6 +43,14 @@ const authRateLimit = rateLimit({
   message: { error: 'Too many authentication attempts. Please try again later.' },
 });
 
+const trendingRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many trending requests. Please try again later.' },
+});
+
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value > 0;
 }
@@ -58,6 +71,34 @@ function isValidRating(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 10;
 }
 
+// Tri-state parsers for optional query params: undefined = not provided,
+// null = provided but invalid, a number = a valid value ready to use.
+function parseOptionalYear(value: unknown): number | undefined | null {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (typeof value !== 'string' || !/^\d{4}$/.test(value)) {
+    return null;
+  }
+
+  const year = Number(value);
+  return year >= 1888 && year <= new Date().getFullYear() + 10 ? year : null;
+}
+
+function parseOptionalPositiveInteger(value: unknown): number | undefined | null {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    return null;
+  }
+
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
 // Shared by /watchlist and /search: looks up the user's stored language
 // preference and converts it from the DB's underscore format to TMDb's.
 async function getUserLanguage(userId: number): Promise<TmdbLanguage | null> {
@@ -73,6 +114,16 @@ async function getUserLanguage(userId: number): Promise<TmdbLanguage | null> {
   return dbLanguageToTmdb(user.language) ?? null;
 }
 
+// Resolves which language to use for a TMDb request: an explicit,
+// already-validated override takes priority, otherwise falls back to the
+// user's stored preference.
+async function resolveLanguage(userId: number, override: TmdbLanguage | undefined): Promise<TmdbLanguage | null> {
+  if (override) {
+    return override;
+  }
+  return getUserLanguage(userId);
+}
+
 // Security middleware: safe HTTP headers (helmet), cross-origin requests
 // restricted to the configured frontend (cors), and a cap on request body
 // size to limit the impact of oversized payloads (express.json limit).
@@ -82,6 +133,22 @@ app.use(express.json({ limit: '10kb' }));
 
 app.get('/', (_req: Request, res: Response) => {
   res.send('hello world');
+});
+
+app.get('/trending', trendingRateLimit, async (req: Request, res: Response) => {
+  try {
+    const { lang } = req.query;
+
+    if (lang !== undefined && (typeof lang !== 'string' || !isTmdbLanguage(lang))) {
+      return res.status(400).json({ error: `lang must be one of: ${ALLOWED_LANGUAGES.join(', ')}` });
+    }
+
+    const posters = await getRecentPosters(lang && isTmdbLanguage(lang) ? lang : 'es-ES');
+    return res.status(200).json(posters);
+  } catch (error) {
+    console.error('[TRENDING ERROR]', error);
+    return res.status(502).json({ error: 'Unable to fetch trending posters from TMDb' });
+  }
 });
 
 app.post('/auth/register', authRateLimit, async (req: Request, res: Response) => {
@@ -316,6 +383,7 @@ app.get('/watchlist', authenticateJWT, async (req: AuthenticatedRequest, res: Re
         ...item,
         title: details?.title ?? null,
         poster: details?.poster ?? null,
+        year: details?.year ?? null,
       };
     });
 
@@ -430,22 +498,119 @@ app.get('/search', authenticateJWT, async (req: AuthenticatedRequest, res: Respo
       return res.status(400).json({ error: `lang must be one of: ${ALLOWED_LANGUAGES.join(', ')}` });
     }
 
-    const userLanguage = await getUserLanguage(authenticatedUserId);
-
-    if (!userLanguage) {
+    const language = await resolveLanguage(authenticatedUserId, typeof lang === 'string' && isTmdbLanguage(lang) ? lang : undefined);
+    if (!language) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // An explicit ?lang= overrides the user's stored preference for this request only.
-    const language = (lang && isTmdbLanguage(lang) ? lang : userLanguage);
     const results = await searchTMDb(query, language);
     return res.status(200).json(results);
   } catch (error) {
     console.error('[SEARCH ERROR]', error);
-    return res.status(500).json({ error: 'An error occurred while searching TMDb' });
+    return res.status(502).json({ error: 'An error occurred while searching TMDb' });
   }
 });
 
+app.get('/titles/:type/:tmdbId', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { type, tmdbId } = req.params;
+    const authenticatedUserId = req.user?.id;
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (type !== 'movie' && type !== 'tv') {
+      return res.status(400).json({ error: 'type must be movie or tv' });
+    }
+
+    const numericTmdbId = Number(tmdbId);
+    if (!isPositiveInteger(numericTmdbId)) {
+      return res.status(400).json({ error: 'tmdbId must be a positive integer' });
+    }
+
+    const language = await getUserLanguage(authenticatedUserId);
+    if (!language) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const details = await getTitleFullDetails(numericTmdbId, type, language);
+    return res.status(200).json(details);
+  } catch (error) {
+    console.error('[TITLE DETAILS ERROR]', error);
+    return res.status(502).json({ error: 'Unable to fetch title details from TMDb' });
+  }
+});
+
+
+app.get('/genres', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { type, lang } = req.query;
+    const authenticatedUserId = req.user?.id;
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if ((type !== 'movie' && type !== 'tv') || (lang !== undefined && (typeof lang !== 'string' || !isTmdbLanguage(lang)))) {
+      return res.status(400).json({ error: 'type must be movie or tv and lang must be a supported language' });
+    }
+
+    const language = await resolveLanguage(authenticatedUserId, typeof lang === 'string' && isTmdbLanguage(lang) ? lang : undefined);
+    if (!language) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const genres = await getGenres(type, language);
+    return res.status(200).json(genres);
+  } catch (error) {
+    console.error('[GENRES ERROR]', error);
+    return res.status(502).json({ error: 'Unable to fetch genres from TMDb' });
+  }
+});
+
+app.get('/discover', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { type, genre, yearFrom, yearTo, lang } = req.query;
+    const authenticatedUserId = req.user?.id;
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    if (type !== 'movie' && type !== 'tv') {
+      return res.status(400).json({ error: 'type must be movie or tv' });
+    }
+
+    if (lang !== undefined && (typeof lang !== 'string' || !isTmdbLanguage(lang))) {
+      return res.status(400).json({ error: `lang must be one of: ${ALLOWED_LANGUAGES.join(', ')}` });
+    }
+
+    const genreId = parseOptionalPositiveInteger(genre);
+    const from = parseOptionalYear(yearFrom);
+    const to = parseOptionalYear(yearTo);
+
+    if (genreId === null || from === null || to === null || (from !== undefined && to !== undefined && from > to)) {
+      return res.status(400).json({ error: 'genre, yearFrom and yearTo must be valid values' });
+    }
+
+    const language = await resolveLanguage(authenticatedUserId, typeof lang === 'string' && isTmdbLanguage(lang) ? lang : undefined);
+    if (!language) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const results = await discoverTitles(type, genreId, from, to, language);
+    return res.status(200).json(results);
+  } catch (error) {
+    console.error('[DISCOVER ERROR]', error);
+    return res.status(502).json({ error: 'Unable to discover titles from TMDb' });
+  }
+});
+
+
+
+
+// Early test routes
 app.get('/protected', authenticateJWT, (_req, res) => {
   res.json({ message: 'If you can see this, your token is valid' });
 });

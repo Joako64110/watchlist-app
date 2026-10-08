@@ -52,6 +52,18 @@ interface TmdbDiscoverItem {
   genre_ids?: number[];
 }
 
+type PosterSource = 'movie' | 'tv'
+
+interface TmdbDiscoverPage {
+  results?: TmdbDiscoverItem[]
+  total_pages?: number
+}
+
+interface DatedPosterCandidate {
+  poster: string
+  date: string
+}
+
 interface TmdbGenre {
   id: number;
   name: string;
@@ -86,6 +98,7 @@ const TMDB_LANGUAGE_TO_DB: Record<TmdbLanguage, DbLanguage> = Object.fromEntries
 const RECENT_POSTERS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const RECENT_POSTERS_CACHE_SIZE = 60;
 const recentPostersCache = new Map<TmdbLanguage, { posters: string[]; fetchedAt: number }>();
+const MAX_POSTER_PAGES_PER_TYPE = 3
 
 export function isTmdbLanguage(value: unknown): value is TmdbLanguage {
   return typeof value === 'string' && ALLOWED_LANGUAGES.includes(value as TmdbLanguage);
@@ -254,47 +267,74 @@ export async function discoverTitles(
   }));
 }
 
-// Cached per language so the landing page's poster wall doesn't hit TMDb
-// on every visit — it refreshes at most once per RECENT_POSTERS_CACHE_TTL_MS.
 export async function getRecentPosters(language: TmdbLanguage = 'es-ES', limit = 40): Promise<string[]> {
-  const cached = recentPostersCache.get(language);
+  const cached = recentPostersCache.get(language)
 
   if (cached && Date.now() - cached.fetchedAt < RECENT_POSTERS_CACHE_TTL_MS) {
-    return cached.posters.slice(0, Math.min(limit, cached.posters.length));
+    return cached.posters.slice(0, Math.min(limit, cached.posters.length))
   }
 
-  const headers = buildAuthHeaders();
-  const today = new Date().toISOString().slice(0, 10);
+  const headers = buildAuthHeaders()
+  const today = new Date().toISOString().slice(0, 10)
+  const sources: PosterSource[] = ['movie', 'tv']
+  const currentPage: Record<PosterSource, number> = { movie: 0, tv: 0 }
+  const totalPages: Record<PosterSource, number> = { movie: 1, tv: 1 }
+  const candidates: DatedPosterCandidate[] = []
+  const usedPosters = new Set<string>()
 
-  // A single TMDb page only returns 20 results. Fetching two pages per type
-  // (40 movies + 40 TV, before filtering) gives enough raw candidates for
-  // the pool to actually reach RECENT_POSTERS_CACHE_SIZE.
-  const [moviesPage1, moviesPage2, tvPage1, tvPage2] = await Promise.all([
-    axios.get(`${TMDB_BASE_URL}/discover/movie?language=${encodeURIComponent(language)}&sort_by=primary_release_date.desc&primary_release_date.lte=${today}&page=1`, { headers, timeout: TMDB_REQUEST_TIMEOUT_MS }),
-    axios.get(`${TMDB_BASE_URL}/discover/movie?language=${encodeURIComponent(language)}&sort_by=primary_release_date.desc&primary_release_date.lte=${today}&page=2`, { headers, timeout: TMDB_REQUEST_TIMEOUT_MS }),
-    axios.get(`${TMDB_BASE_URL}/discover/tv?language=${encodeURIComponent(language)}&sort_by=first_air_date.desc&first_air_date.lte=${today}&page=1`, { headers, timeout: TMDB_REQUEST_TIMEOUT_MS }),
-    axios.get(`${TMDB_BASE_URL}/discover/tv?language=${encodeURIComponent(language)}&sort_by=first_air_date.desc&first_air_date.lte=${today}&page=2`, { headers, timeout: TMDB_REQUEST_TIMEOUT_MS }),
-  ]);
+  const fetchNextPage = async (type: PosterSource) => {
+    const page = currentPage[type] + 1
+    const dateField = type === 'movie' ? 'primary_release_date' : 'first_air_date'
 
-  // TMDb has no single endpoint that mixes movies and TV sorted by date, so
-  // we fetch each type's most recent releases separately and merge+re-sort here.
-  const datedItems = [
-    ...[...moviesPage1.data.results, ...moviesPage2.data.results].map((item: TmdbDiscoverItem) => ({
-      poster: buildPosterUrl(item.poster_path),
-      date: item.release_date,
-    })),
-    ...[...tvPage1.data.results, ...tvPage2.data.results].map((item: TmdbDiscoverItem) => ({
-      poster: buildPosterUrl(item.poster_path),
-      date: item.first_air_date,
-    })),
-  ];
+    const response = await axios.get<TmdbDiscoverPage>(`${TMDB_BASE_URL}/discover/${type}`, {
+      headers,
+      timeout: TMDB_REQUEST_TIMEOUT_MS,
+      params: {
+        language,
+        sort_by: `${dateField}.desc`,
+        [`${dateField}.lte`]: today,
+        page,
+      },
+    })
 
-  const posters = datedItems
-    .filter((item): item is { poster: string; date: string } => Boolean(item.poster && item.date))
+    currentPage[type] = page
+    totalPages[type] = Math.min(
+      MAX_POSTER_PAGES_PER_TYPE,
+      Math.max(page, response.data.total_pages ?? page)
+    )
+
+    for (const item of response.data.results ?? []) {
+      const date = type === 'movie' ? item.release_date : item.first_air_date
+      const poster = buildPosterUrl(item.poster_path)
+
+      if (!date || !poster || usedPosters.has(poster)) {
+        continue
+      }
+
+      usedPosters.add(poster)
+      candidates.push({ poster, date })
+    }
+  }
+
+  await Promise.all(sources.map(fetchNextPage))
+
+  while (candidates.length < RECENT_POSTERS_CACHE_SIZE) {
+    const sourcesWithMorePages = sources.filter(
+      type => currentPage[type] < totalPages[type]
+    )
+
+    if (sourcesWithMorePages.length === 0) {
+      break
+    }
+
+    await Promise.all(sourcesWithMorePages.map(fetchNextPage))
+  }
+
+  const posters = candidates
     .sort((a, b) => b.date.localeCompare(a.date))
     .slice(0, RECENT_POSTERS_CACHE_SIZE)
-    .map(item => item.poster);
+    .map(candidate => candidate.poster)
 
-  recentPostersCache.set(language, { posters, fetchedAt: Date.now() });
-  return posters.slice(0, Math.min(limit, posters.length));
+  recentPostersCache.set(language, { posters, fetchedAt: Date.now() })
+  return posters.slice(0, Math.min(limit, posters.length))
 }
